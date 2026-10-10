@@ -89,14 +89,13 @@ DEFAULT_STATE = {
     "season": "Any",
     "setting": "Any",
     "squares": [],
-    "selected": None,
     "start": None,
     "end": None,
     "ended_early": False,
     "used_hashes": {},
     "checks": 0,
     "nonce": 0,
-    "flash": None,
+    "dialog_result": None,
     "used_fallback": False,
 }
 
@@ -115,15 +114,10 @@ def reset_game():
         st.session_state[key] = copy.deepcopy(value)
 
 
-def select_square(idx):
-    st.session_state.selected = idx
-
-
 def finish_game(early):
     st.session_state.end = time.time()
     st.session_state.ended_early = early
     st.session_state.stage = "finished"
-    st.session_state.selected = None
 
 
 # --------------------------------------------------------------------------
@@ -308,32 +302,32 @@ Return ONLY JSON, with no markdown:
 # Game logic
 # --------------------------------------------------------------------------
 def handle_check(idx, uploaded):
+    """Verify an uploaded photo for a square and store the outcome for the dialog."""
     ss = st.session_state
     square = ss.squares[idx]
 
+    def outcome(kind, message, fact=""):
+        ss.dialog_result = {"idx": idx, "kind": kind, "message": message, "fact": fact}
+
     if ss.checks >= MAX_CHECKS_PER_SESSION:
-        ss.flash = ("warning", "You've reached the photo-check limit for this session.", "")
-        return
+        return outcome("warning", "You've reached the photo-check limit for this session.")
 
     raw = uploaded.getvalue()
     digest = hashlib.sha256(raw).hexdigest()
     if digest in ss.used_hashes:
         other = ss.squares[ss.used_hashes[digest]]["title"]
-        ss.flash = ("warning", f"You already used this photo for \"{other}\". Find a new one!", "")
-        return
+        return outcome("warning", f"You already used this photo for \"{other}\". Find a new one!")
 
     try:
         image_bytes = prepare_image(raw)
     except Exception:  # noqa: BLE001
-        ss.flash = ("error", "That file couldn't be read as an image. Try a JPG, PNG or WebP.", "")
-        return
+        return outcome("error", "That file couldn't be read as an image. Try a JPG, PNG or WebP.")
 
     ss.checks += 1
     try:
         result = verify_photo(square, image_bytes, ss.region)
     except Exception as exc:  # noqa: BLE001
-        ss.flash = ("error", f"Couldn't check the photo right now: {exc}", "")
-        return
+        return outcome("error", f"Couldn't check the photo right now: {exc}")
 
     ss.nonce += 1  # resets the uploader
     if result["match"] and result["is_real_scene"]:
@@ -341,14 +335,13 @@ def handle_check(idx, uploaded):
         square["fun_fact"] = result["fun_fact"]
         square["found_at"] = time.time()
         ss.used_hashes[digest] = idx
-        ss.selected = None
-        ss.flash = ("success", f"✅ \"{square['title']}\" found! {result['reason']}", result["fun_fact"])
-        if all(s["found"] for s in ss.squares):
+        outcome("success", result["reason"], result["fun_fact"])
+        if all(sq["found"] for sq in ss.squares):
             finish_game(early=False)
     elif not result["is_real_scene"]:
-        ss.flash = ("warning", "That looks like a screen or printed image. Take a photo outdoors!", "")
+        outcome("warning", "That looks like a screen or printed image. Take a photo outdoors!")
     else:
-        ss.flash = ("warning", f"Not quite. {result['reason']} Try another photo.", "")
+        outcome("warning", f"Not quite. {result['reason']} Try another photo.")
 
 
 def build_share_text():
@@ -412,6 +405,50 @@ def timer_display():
         st.caption(f"⏱️ {fmt_time(time.time() - start)}")
 
 
+def _photo_dialog(idx):
+    ss = st.session_state
+    square = ss.squares[idx]
+    result = ss.dialog_result
+    if not result or result["idx"] != idx:
+        result = None
+
+    st.markdown(f"### {square['title']}")
+
+    # Success: celebrate and show the fun fact right here
+    if result and result["kind"] == "success":
+        st.success(f"🎉 Great job! {result['message']}")
+        if result["fact"]:
+            st.info(f"💡 **Fun fact:** {result['fact']}")
+        label = "See results" if ss.stage == "finished" else "Continue"
+        if st.button(label, type="primary"):
+            st.rerun()
+        return
+
+    if square["hint"]:
+        st.caption(f"Hint: {square['hint']}")
+    if result:
+        getattr(st, result["kind"])(result["message"])
+
+    uploaded = st.file_uploader(
+        "Upload a photo",
+        type=["jpg", "jpeg", "png", "webp"],
+        key=f"up_{ss.nonce}_{idx}",
+    )
+    if uploaded is not None:
+        st.image(uploaded, width=240)
+        if st.button("Check photo", type="primary"):
+            with st.spinner("Gemma is looking at your photo..."):
+                handle_check(idx, uploaded)
+            st.rerun(scope="fragment")
+
+
+# Refresh the card behind the dialog if the player closes it with the X
+try:
+    photo_dialog = st.dialog("Upload your photo", on_dismiss="rerun")(_photo_dialog)
+except TypeError:  # older Streamlit without on_dismiss
+    photo_dialog = st.dialog("Upload your photo")(_photo_dialog)
+
+
 def play_page():
     ss = st.session_state
     n = ss.n
@@ -427,13 +464,6 @@ def play_page():
 
     st.progress(found_count / len(ss.squares), text=f"{found_count}/{len(ss.squares)} found")
 
-    if ss.flash:
-        kind, message, fact = ss.flash
-        getattr(st, kind)(message)
-        if fact:
-            st.info(f"💡 {fact}")
-        ss.flash = None
-
     # Card
     for r in range(n):
         cols = st.columns(n)
@@ -445,30 +475,12 @@ def play_page():
                     if square["found"]:
                         st.markdown(f"✅ **{square['title']}**")
                     else:
-                        marker = "👉 " if ss.selected == idx else ""
-                        st.markdown(f"{marker}{square['title']}")
-                        st.button("Pick", key=f"pick_{idx}", on_click=select_square, args=(idx,))
+                        st.markdown(square["title"])
+                        if st.button("📷 Photo", key=f"pick_{idx}"):
+                            ss.dialog_result = None
+                            photo_dialog(idx)
 
-    # Photo panel
-    idx = ss.selected
-    if idx is not None and not ss.squares[idx]["found"]:
-        square = ss.squares[idx]
-        st.subheader(square["title"])
-        if square["hint"]:
-            st.caption(f"Hint: {square['hint']}")
-        uploaded = st.file_uploader(
-            "Upload a photo",
-            type=["jpg", "jpeg", "png", "webp"],
-            key=f"up_{ss.nonce}_{idx}",
-        )
-        if uploaded is not None:
-            st.image(uploaded, width=260)
-            if st.button("Check photo", type="primary"):
-                with st.spinner("Gemma is looking at your photo..."):
-                    handle_check(idx, uploaded)
-                st.rerun()
-    else:
-        st.caption("Tap **Pick** on a square, then upload a photo of what you found.")
+    st.caption("Tap **📷 Photo** on a square to upload what you found.")
 
     # Optional END button
     st.divider()
